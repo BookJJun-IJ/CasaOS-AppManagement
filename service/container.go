@@ -764,9 +764,12 @@ func (ds *dockerService) RemoveContainer(name string, update bool) error {
 		return nil
 	}
 
-	// 路径处理
+	// 路径处理 (path handling)
 	if path := docker.GetDir(name, "/config"); !file.CheckNotExist(path) {
-		return file.RMDir(path)
+		// Try normal removal first, then use Docker for root-owned files
+		if err := file.RMDir(path); err != nil {
+			return docker.RemovePathAsRoot(ctx, path)
+		}
 	}
 
 	return nil

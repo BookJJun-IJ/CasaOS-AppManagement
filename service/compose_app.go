@@ -622,12 +622,17 @@ func (a *ComposeApp) Uninstall(ctx context.Context, deleteConfigFolder bool) err
 		for _, volume := range app.Volumes {
 			if strings.Contains(volume.Source, a.Name) {
 				path := filepath.Join(strings.Split(volume.Source, a.Name)[0], a.Name)
+				// Try normal removal first, then use Docker for root-owned files
 				if err := file.RMDir(path); err != nil {
-					logger.Error("failed to remove compose app config folder", zap.Error(err), zap.String("path", path))
+					logger.Info("normal removal failed, trying with root privileges", zap.String("path", path), zap.Error(err))
 
-					go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
-						common.PropertyTypeMessage.Name: err.Error(),
-					})
+					if err := docker.RemovePathAsRoot(ctx, path); err != nil {
+						logger.Error("failed to remove compose app config folder", zap.Error(err), zap.String("path", path))
+
+						go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
+							common.PropertyTypeMessage.Name: err.Error(),
+						})
+					}
 				}
 			}
 		}

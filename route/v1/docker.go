@@ -11,6 +11,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS-AppManagement/common"
 	"github.com/IceWhaleTech/CasaOS-AppManagement/model"
 	"github.com/IceWhaleTech/CasaOS-AppManagement/pkg/config"
+	"github.com/IceWhaleTech/CasaOS-AppManagement/pkg/docker"
 	v2 "github.com/IceWhaleTech/CasaOS-AppManagement/route/v2"
 	"github.com/IceWhaleTech/CasaOS-AppManagement/service"
 	v1 "github.com/IceWhaleTech/CasaOS-AppManagement/service/v1"
@@ -745,12 +746,15 @@ func uninstall(ctx context.Context, container *types.ContainerJSON, isDelete boo
 	}
 
 	if container.Config.Labels["origin"] != "custom" && isDelete {
-		// step: 删除文件夹
+		// step: 删除文件夹 (delete folders)
 		for _, v := range container.Mounts {
 			if strings.Contains(v.Source, container.Name) {
 				path := filepath.Join(strings.Split(v.Source, container.Name)[0], container.Name)
+				// Try normal removal first, then use Docker for root-owned files
 				if err := file.RMDir(path); err != nil {
-					return err
+					if err := docker.RemovePathAsRoot(ctx, path); err != nil {
+						return err
+					}
 				}
 			}
 		}
