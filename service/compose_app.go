@@ -868,6 +868,10 @@ func (a *ComposeApp) HealthCheck() (bool, error) {
 	}
 
 	hostname := common.Localhost
+	if a.Name != "" {
+	    hostname = a.Name
+    }
+
 	if storeInfo.Hostname != nil && *storeInfo.Hostname != "" {
 		hostname = *storeInfo.Hostname
 	}
@@ -960,10 +964,6 @@ func NewComposeAppFromYAML(yaml []byte, skipInterpolation, skipValidation bool) 
 	}
 	defer os.RemoveAll(tmpWorkingDir)
 
-	// the WEBUI_PORT interpolate will tiger twice. In `pulished` and `port-map`.
-	// So we need to promise multiple WEBUI_PORT interpolate is a same value.
-	port, _ := port.GetAvailablePort("tcp")
-
 	project, err := loader.Load(
 		types.ConfigDetails{
 			ConfigFiles: []types.ConfigFile{
@@ -978,31 +978,11 @@ func NewComposeAppFromYAML(yaml []byte, skipInterpolation, skipValidation bool) 
 			WorkingDir: tmpWorkingDir,
 		},
 		func(o *loader.Options) {
-			o.SkipInterpolation = skipInterpolation
+			o.SkipInterpolation = true
 			o.SkipValidation = skipValidation
 
 			o.Interpolate.LookupValue = func(key string) (string, bool) {
-				switch key {
-				case "WEBUI_PORT":
-					fmt.Printf("WEBUI_PORT is not specified, using %d\n", port)
-					return strconv.Itoa(port), true
-				}
-
-				for k := range baseInterpolationMap() {
-					if k == key {
-						// example:  TZ => $TZ
-						// we didn't want to interpolate base interpolation value.
-						// they should be interpolated in LoadComposeAppFromConfig
-						return fmt.Sprintf("$%s", k), true
-					}
-				}
-				// the function may can to replace the above code.
-				value, ok := os.LookupEnv(key)
-				if ok {
-					return value, true
-				} else {
-					return fmt.Sprintf("$%s", key), true
-				}
+				return fmt.Sprintf("$%s", key), true
 			}
 
 			if getNameFrom(yaml) != "" {

@@ -305,7 +305,7 @@ func (a *AppManagement) ComposeApp(ctx echo.Context, id codegen.StoreAppIDString
 
 	accept := ctx.Request().Header.Get(echo.HeaderAccept)
 	if accept == common.MIMEApplicationYAML {
-		yaml, err := yaml.Marshal(composeApp)
+		yaml, err := yaml.Marshal(updateConectivityAndStorageComposeData((*codegen.ComposeApp)(composeApp)))
 		if err != nil {
 			message := err.Error()
 			return ctx.JSON(http.StatusInternalServerError, codegen.ResponseInternalServerError{
@@ -325,13 +325,15 @@ func (a *AppManagement) ComposeApp(ctx echo.Context, id codegen.StoreAppIDString
 	}
 
 	message := fmt.Sprintf("!! JSON format is for debugging purpose only - use `Accept: %s` HTTP header to get YAML instead !!", common.MIMEApplicationYAML)
+	data := codegen.ComposeAppWithStoreInfo{
+		StoreInfo: storeInfo,
+		Compose:   updateConectivityAndStorageComposeData((*codegen.ComposeApp)(composeApp)),
+	}
+
 	return ctx.JSON(http.StatusOK, codegen.ComposeAppOK{
 		// extension properties aren't marshalled - https://github.com/golang/go/issues/6213
 		Message: &message,
-		Data: &codegen.ComposeAppWithStoreInfo{
-			StoreInfo: storeInfo,
-			Compose:   (*codegen.ComposeApp)(composeApp),
-		},
+		Data:    &data,
 	})
 }
 
