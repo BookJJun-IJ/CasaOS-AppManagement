@@ -394,26 +394,11 @@ func (a *ComposeApp) UpWithCheckRequire(ctx context.Context, service api.Service
 				continue
 			}
 
-			path := volume.Source
-			if err := file.IsNotExistMkDir(path); err != nil {
-				go PublishEventWrapper(ctx, common.EventTypeContainerStartError, map[string]string{
-					common.PropertyTypeMessage.Name: err.Error(),
-				})
-				return err
-			}
 		}
 
-		// check if each required device exists
-		deviceMapFiltered := []string{}
-		for _, deviceMap := range app.Devices {
-			devicePath := strings.SplitN(deviceMap, ":", 2)[0]
-			if file.CheckNotExist(devicePath) {
-				logger.Info("device not found", zap.String("device", devicePath))
-				continue
-			}
-			deviceMapFiltered = append(deviceMapFiltered, deviceMap)
-		}
-		a.Services[i].Devices = deviceMapFiltered
+		// Allow all devices - no filtering based on existence
+		// Docker will handle device availability at runtime
+		a.Services[i].Devices = app.Devices
 	}
 
 	if err := a.Up(ctx, service); err != nil {
@@ -514,26 +499,17 @@ func (a *ComposeApp) PullAndInstall(ctx context.Context) error {
 					continue
 				}
 
-				path := volume.Source
-				if err := file.IsNotExistMkDir(path); err != nil {
-					go PublishEventWrapper(ctx, common.EventTypeContainerCreateError, map[string]string{
-						common.PropertyTypeMessage.Name: err.Error(),
-					})
-					return err
+				// Create directory and set ownership if conditions are met
+				if err := PrepareVolumeDirectory(volume.Source); err != nil {
+					logger.Error("failed to prepare volume directory", zap.Error(err), zap.String("path", volume.Source))
+					// Don't fail installation, just log the error
 				}
-			}
 
-			// check if each required device exists
-			deviceMapFiltered := []string{}
-			for _, deviceMap := range app.Devices {
-				devicePath := strings.SplitN(deviceMap, ":", 2)[0]
-				if file.CheckNotExist(devicePath) {
-					logger.Info("device not found", zap.String("device", devicePath))
-					continue
 				}
-				deviceMapFiltered = append(deviceMapFiltered, deviceMap)
-			}
-			a.Services[i].Devices = deviceMapFiltered
+
+			// Allow all devices - no filtering based on existence
+			// Docker will handle device availability at runtime
+			a.Services[i].Devices = app.Devices
 		}
 
 		if err := a.Create(ctx, api.CreateOptions{}, service); err != nil {
@@ -598,7 +574,7 @@ func (a *ComposeApp) Uninstall(ctx context.Context, deleteConfigFolder bool) err
 
 	if err := service.Down(ctx, a.Name, api.DownOptions{
 		RemoveOrphans: true,
-		Images:        "all",
+		Images:        "",
 		Volumes:       true,
 	}); err != nil {
 		go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
@@ -608,7 +584,8 @@ func (a *ComposeApp) Uninstall(ctx context.Context, deleteConfigFolder bool) err
 		return err
 	}
 
-	if err := file.RMDir(a.WorkingDir); err != nil {
+	if err := docker.RemovePathAsRoot(ctx, a.WorkingDir); err != nil {
+		logger.Error("failed to remove working dir", zap.String("path", a.WorkingDir), zap.Error(err))
 		go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
 			common.PropertyTypeMessage.Name: err.Error(),
 		})
@@ -618,21 +595,49 @@ func (a *ComposeApp) Uninstall(ctx context.Context, deleteConfigFolder bool) err
 		return nil
 	}
 
+	// Archive app data before deletion
+	dataRoot := os.Getenv("DATA_ROOT")
+	if dataRoot == "" {
+		dataRoot = "/DATA"
+	}
+	archiveDir := filepath.Join(dataRoot, "AppData")
+	timestamp := time.Now().Format("20060102_150405")
+	archived := make(map[string]bool)
+
 	for _, app := range a.Services {
 		for _, volume := range app.Volumes {
 			if strings.Contains(volume.Source, a.Name) {
 				path := filepath.Join(strings.Split(volume.Source, a.Name)[0], a.Name)
-				// Try normal removal first, then use Docker for root-owned files
-				if err := file.RMDir(path); err != nil {
-					logger.Info("normal removal failed, trying with root privileges", zap.String("path", path), zap.Error(err))
+				if archived[path] {
+					continue
+				}
+				archived[path] = true
 
-					if err := docker.RemovePathAsRoot(ctx, path); err != nil {
-						logger.Error("failed to remove compose app config folder", zap.Error(err), zap.String("path", path))
+				archiveName := fmt.Sprintf("%s_%s.zip", a.Name, timestamp)
+				logger.Info("archiving app data before deletion",
+					zap.String("path", path),
+					zap.String("archiveDir", archiveDir),
+					zap.String("archiveName", archiveName))
 
-						go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
-							common.PropertyTypeMessage.Name: err.Error(),
-						})
-					}
+				if err := docker.ArchivePath(ctx, path, archiveDir, a.Name, archiveName); err != nil {
+					logger.Error("failed to archive app data",
+						zap.String("path", path),
+						zap.Error(err))
+				}
+			}
+		}
+	}
+
+	// Delete volume paths after archiving
+	for _, app := range a.Services {
+		for _, volume := range app.Volumes {
+			if strings.Contains(volume.Source, a.Name) {
+				path := filepath.Join(strings.Split(volume.Source, a.Name)[0], a.Name)
+				if err := docker.RemovePathAsRoot(ctx, path); err != nil {
+					logger.Error("failed to remove volume path", zap.String("path", path), zap.Error(err))
+					go PublishEventWrapper(ctx, common.EventTypeImageRemoveError, map[string]string{
+						common.PropertyTypeMessage.Name: err.Error(),
+					})
 				}
 			}
 		}
@@ -978,10 +983,26 @@ func NewComposeAppFromYAML(yaml []byte, skipInterpolation, skipValidation bool) 
 			WorkingDir: tmpWorkingDir,
 		},
 		func(o *loader.Options) {
-			o.SkipInterpolation = true
+			o.SkipInterpolation = skipInterpolation
 			o.SkipValidation = skipValidation
 
 			o.Interpolate.LookupValue = func(key string) (string, bool) {
+				// Check if this is a baseInterpolationMap variable
+				// These should NOT be interpolated here (they're handled later in LoadComposeAppFromConfigFile)
+				for k := range baseInterpolationMap() {
+					if k == key {
+						return fmt.Sprintf("$%s", key), true
+					}
+				}
+
+				// For all other variables, look up from OS environment
+				// This allows DATA_ROOT and other PCS variables to work at the appstore level
+				value, ok := os.LookupEnv(key)
+				if ok {
+					return value, true
+				}
+
+				// Variable not found, keep as $VAR
 				return fmt.Sprintf("$%s", key), true
 			}
 

@@ -3,10 +3,11 @@ package v2
 import (
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strconv"
 
 	"github.com/IceWhaleTech/CasaOS-AppManagement/codegen"
+	"github.com/IceWhaleTech/CasaOS-AppManagement/pkg/install_cmd"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/compose-spec/compose-go/types"
 	"go.uber.org/zap"
@@ -37,7 +38,7 @@ func updateConectivityAndStorageComposeData(composeR *codegen.ComposeApp) *codeg
 		zap.String("PGID", pgid))
 
 	// Update the x-casaos extensions
-	useDynamicWebUIPort := updateCasaOSExtensions(&compose)
+	updateCasaOSExtensions(&compose)
 
 	// Modify services if needed
 	if dataRoot != "" || refNet != "" || shouldAddUserRights(puid, pgid) {
@@ -47,14 +48,13 @@ func updateConectivityAndStorageComposeData(composeR *codegen.ComposeApp) *codeg
 			return composeR
 		}
 
-		modifyServices(&compose, dataRoot, refNet, useDynamicWebUIPort, puid, pgid)
+		modifyServices(&compose, dataRoot, refNet, puid, pgid)
 	}
 
 	return &compose
 }
 
-func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
-	useDynamicWebUIPort := false
+func updateCasaOSExtensions(compose *codegen.ComposeApp) {
 
 	// Read environment variables inside the function
 	refScheme := getEnvWithDefault("REF_SCHEME", "http")
@@ -73,7 +73,7 @@ func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
 
 	casaosExt, ok := compose.Extensions["x-casaos"]
 	if !ok {
-		return useDynamicWebUIPort
+		return
 	}
 
 	casaosExtensions, ok := casaosExt.(map[string]interface{})
@@ -81,7 +81,7 @@ func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
 		logger.Error("PCS: invalid x-casaos extension format",
 			zap.String("name", compose.Name),
 			zap.Any("extensions", casaosExt))
-		return useDynamicWebUIPort
+		return
 	}
 
 	extCopy := make(map[string]interface{})
@@ -92,19 +92,27 @@ func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
 	if len(compose.Services) == 0 {
 		logger.Error("PCS: no services defined in compose",
 			zap.String("name", compose.Name))
-		return useDynamicWebUIPort
+		return
 	}
 
-	webuiExposePort := determineWebUIPort(extCopy, compose, &useDynamicWebUIPort)
+	webuiExposePort := determineWebUIPort(extCopy, compose)
 
 	logger.Info("PCS: found webui expose port",
 		zap.String("port", webuiExposePort),
 		zap.String("name", compose.Name))
 
-	extCopy["scheme"] = refScheme
-	extCopy["port_map"] = refPort
+	// Only set scheme if not already defined
+	if _, exists := extCopy["scheme"]; !exists {
+		extCopy["scheme"] = refScheme
+	}
 
-	if refDomain != "" && isValidDomain(refDomain) {
+	// Only set port_map if not already defined
+	if _, exists := extCopy["port_map"]; !exists {
+		extCopy["port_map"] = refPort
+	}
+
+	// Only set hostname if not already defined and refDomain is provided
+	if _, exists := extCopy["hostname"]; !exists && refDomain != "" && isValidDomain(refDomain) {
 		// Check if the webui port matches the default port
 		if webuiExposePort == refDefaultPort {
 			// Use format without port prefix: service-domain
@@ -126,7 +134,7 @@ func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
 				zap.String("port", webuiExposePort),
 				zap.String("default_port", refDefaultPort))
 		}
-	} else if refDomain != "" {
+	} else if refDomain != "" && !isValidDomain(refDomain) {
 		logger.Info("PCS: invalid domain name provided",
 			zap.String("domain", refDomain))
 	}
@@ -135,7 +143,6 @@ func updateCasaOSExtensions(compose *codegen.ComposeApp) bool {
 	expandTipsBeforeInstall(extCopy, compose.Name)
 
 	compose.Extensions["x-casaos"] = extCopy
-	return useDynamicWebUIPort
 }
 
 // expandTipsBeforeInstall expands environment variables in the tips.before_install field
@@ -191,7 +198,7 @@ func expandEnvVars(text string) string {
 	return os.Expand(text, os.Getenv)
 }
 
-func determineWebUIPort(extCopy map[string]interface{}, compose *codegen.ComposeApp, useDynamicWebUIPort *bool) string {
+func determineWebUIPort(extCopy map[string]interface{}, compose *codegen.ComposeApp) string {
 	webuiExposePort := "80" // Default port
 
 	if portVal, exists := extCopy["webui_port"]; exists && portVal != nil {
@@ -226,45 +233,47 @@ func determineWebUIPort(extCopy map[string]interface{}, compose *codegen.Compose
 				zap.String("name", compose.Name),
 				zap.Any("webui_port", portVal))
 		}
-	} else {
-		*useDynamicWebUIPort = true
-		// Check if we have services and ports available
-		if len(compose.Services) > 0 && len(compose.Services[0].Ports) > 0 {
-			port := compose.Services[0].Ports[0].Target
-			if port > 0 && port < 65536 {
-				webuiExposePort = strconv.Itoa(int(port))
-			} else {
-				logger.Info("PCS: invalid port in service config, using default",
-					zap.String("name", compose.Name),
-					zap.Uint32("port", port))
-			}
-		} else {
-			logger.Info("PCS: no ports defined for first service, using default",
-				zap.String("name", compose.Name))
-			if len(compose.Services) > 0 {
-				logger.Info("Service without ports",
-					zap.String("service", compose.Services[0].Name))
-			}
-		}
 	}
-
 	return webuiExposePort
 }
 
-func modifyServices(compose *codegen.ComposeApp, dataRoot, refNet string, useDynamicWebUIPort bool, puid, pgid string) {
+func getMainServiceName(compose *codegen.ComposeApp) string {
+	casaosExt, ok := compose.Extensions["x-casaos"]
+	if !ok {
+		return ""
+	}
+
+	casaosExtensions, ok := casaosExt.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	mainService, exists := casaosExtensions["main"]
+	if !exists {
+		return ""
+	}
+
+	mainServiceName, ok := mainService.(string)
+	if !ok {
+		return ""
+	}
+
+	return mainServiceName
+}
+
+func modifyServices(compose *codegen.ComposeApp, dataRoot, refNet string, puid, pgid string) {
 	servicesCopy := make([]types.ServiceConfig, len(compose.Services))
+	mainServiceName := getMainServiceName(compose)
+
+	logger.Info("PCS: identified main service for refNet configuration",
+		zap.String("mainService", mainServiceName),
+		zap.String("refNet", refNet))
 
 	for i, service := range compose.Services {
 		servicesCopy[i] = service // Shallow copy of service
 
 		if dataRoot != "" {
 			servicesCopy[i].Volumes = filterVolumes(service.Volumes, dataRoot)
-		}
-
-		if useDynamicWebUIPort {
-			// If the expose port has been set dynamically, we need to update the port to expose
-			servicesCopy[i].Expose = convertPortsToExpose(service.Ports)
-			servicesCopy[i].Ports = nil
 		}
 
 		// Add user rights management
@@ -276,18 +285,52 @@ func modifyServices(compose *codegen.ComposeApp, dataRoot, refNet string, useDyn
 				zap.String("user", userString))
 		}
 
-		if refNet != "" {
-			networksCopy := make(types.Networks)
-			networksCopy[refNet] = types.NetworkConfig{
-				Name:     refNet,
-				External: types.External{External: true},
-			}
-			compose.Networks = networksCopy
+		// If NetworkMode is set, skip network-related operations
+		if service.NetworkMode != "bridge" && service.NetworkMode != "" {
+			logger.Info("PCS: NetworkMode is set, skipping network configuration",
+				zap.String("service", service.Name),
+				zap.String("network_mode", service.NetworkMode))
+		} else {
+			// Only apply refNet to the main service
+			if refNet != "" && mainServiceName != "" && service.Name == mainServiceName {
+				// Add refNet to compose networks (preserve existing networks)
+				if compose.Networks == nil {
+					compose.Networks = make(types.Networks)
+				}
+				compose.Networks[refNet] = types.NetworkConfig{
+					Name:     refNet,
+					External: types.External{External: true},
+				}
 
-			servicesCopy[i].Hostname = compose.Name
-			servicesCopy[i].NetworkMode = ""
-			servicesCopy[i].Networks = map[string]*types.ServiceNetworkConfig{
-				refNet: {},
+				// Add refNet to service networks (preserve existing networks)
+				if servicesCopy[i].Networks == nil {
+					servicesCopy[i].Networks = make(map[string]*types.ServiceNetworkConfig)
+				}
+				servicesCopy[i].Networks[refNet] = &types.ServiceNetworkConfig{}
+				
+				// Remove network_mode when networks are defined to avoid Docker Compose validation error
+				// "service declares mutually exclusive `network_mode` and `networks`: invalid compose project"
+				if servicesCopy[i].NetworkMode != "" {
+					logger.Info("PCS: removing network_mode from main service to avoid conflict with networks",
+						zap.String("service", service.Name),
+						zap.String("removed_network_mode", servicesCopy[i].NetworkMode))
+					servicesCopy[i].NetworkMode = ""
+				}
+				
+				// Only set hostname if not already set
+				if servicesCopy[i].Hostname == "" {
+					servicesCopy[i].Hostname = compose.Name
+				}
+				
+				logger.Info("PCS: added refNet to main service (preserving existing networks)",
+					zap.String("service", service.Name),
+					zap.String("refNet", refNet),
+					zap.Any("existingNetworks", servicesCopy[i].Networks))
+			} else if refNet != "" && service.Name != mainServiceName {
+				logger.Info("PCS: skipping refNet for non-main service",
+					zap.String("service", service.Name),
+					zap.String("mainService", mainServiceName),
+					zap.String("refNet", refNet))
 			}
 		}
 	}
@@ -296,79 +339,50 @@ func modifyServices(compose *codegen.ComposeApp, dataRoot, refNet string, useDyn
 }
 
 func executePreInstallScript(composeApp *codegen.ComposeApp) error {
-	if composeApp == nil {
-		logger.Error("PCS: cannot execute pre-install script - nil compose app")
-		return fmt.Errorf("nil compose app")
+	// First, ensure AppData folders are created with proper ownership
+	if composeApp != nil && composeApp.Name != "" {
+		dataRoot := getEnvWithDefault("DATA_ROOT", "/DATA")
+		puid := getEnvWithDefault("PUID", "1000")
+		pgid := getEnvWithDefault("PGID", "1000")
+
+		// Folders to create
+		folders := []string{
+			filepath.Join(dataRoot, "AppData", composeApp.Name),
+			filepath.Join(dataRoot, "AppData", "casaos", "apps", composeApp.Name),
+		}
+
+		// Convert PUID/PGID to integers once
+		uid, uidErr := strconv.Atoi(puid)
+		gid, gidErr := strconv.Atoi(pgid)
+
+		for _, folder := range folders {
+			// Create the directory
+			if err := os.MkdirAll(folder, 0755); err != nil {
+				logger.Error("PCS: failed to create AppData folder",
+					zap.String("folder", folder),
+					zap.Error(err))
+			} else {
+				// Set ownership if PUID/PGID are valid
+				if uidErr == nil && gidErr == nil {
+					if err := os.Chown(folder, uid, gid); err != nil {
+						logger.Error("PCS: failed to set ownership for AppData folder",
+							zap.String("folder", folder),
+							zap.Error(err))
+					} else {
+						logger.Info("PCS: created AppData folder",
+							zap.String("folder", folder),
+							zap.String("puid", puid),
+							zap.String("pgid", pgid))
+					}
+				}
+			}
+		}
 	}
 
-	// Check if x-casaos extension exists
-	casaosExt, ok := composeApp.Extensions["x-casaos"]
-	if !ok {
-		logger.Info("PCS: no x-casaos extension found, skipping pre-install script check")
-		return nil
-	}
+	// Then execute any pre-install commands
+	return install_cmd.ExecutePreInstallScript(composeApp)
+}
 
-	// Check if it's a map
-	casaosExtensions, ok := casaosExt.(map[string]interface{})
-	if !ok {
-		logger.Error("PCS: invalid x-casaos extension format",
-			zap.String("name", composeApp.Name),
-			zap.Any("extensions", casaosExt))
-		return fmt.Errorf("invalid x-casaos extension format")
-	}
-
-	// Check for pre-install-cmd
-	preInstallCmd, exists := casaosExtensions["pre-install-cmd"]
-	if !exists || preInstallCmd == nil {
-		logger.Info("PCS: no pre-install-cmd found in x-casaos extension",
-			zap.String("name", composeApp.Name))
-		return nil
-	}
-
-	// Get the command value as string
-	cmdString, ok := preInstallCmd.(string)
-	if !ok || cmdString == "" {
-		logger.Error("PCS: invalid pre-install-cmd value",
-			zap.String("name", composeApp.Name),
-			zap.Any("command", preInstallCmd))
-		return fmt.Errorf("invalid pre-install-cmd value")
-	}
-
-	logger.Info("PCS: executing pre-install command",
-		zap.String("name", composeApp.Name),
-		zap.String("command", cmdString))
-
-	// Create a more robust command execution
-	execCmd := exec.Command("/bin/bash", "-c", cmdString)
-
-	// Set environment variables that might be needed for Docker
-	execCmd.Env = append(os.Environ(),
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"DOCKER_HOST=unix:///var/run/docker.sock")
-
-	// Ensure the command has access to standard streams
-	execCmd.Stdin = os.Stdin
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
-
-	// Log command for debugging
-	logger.Info("PCS: running command",
-		zap.String("command", cmdString),
-		zap.Strings("env", execCmd.Env))
-
-	// Run the command interactively
-	err := execCmd.Run()
-	if err != nil {
-		logger.Error("PCS: failed to execute pre-install command",
-			zap.String("name", composeApp.Name),
-			zap.String("command", cmdString),
-			zap.Error(err))
-		return fmt.Errorf("pre-install command execution failed: %w", err)
-	}
-
-	logger.Info("PCS: pre-install command executed successfully",
-		zap.String("name", composeApp.Name),
-		zap.String("command", cmdString))
-
-	return nil
+func executePostInstallScript(composeApp *codegen.ComposeApp) error {
+	return install_cmd.ExecutePostInstallScript(composeApp)
 }

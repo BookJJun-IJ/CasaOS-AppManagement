@@ -20,6 +20,7 @@ func ReplaceDefaultENV(key, tz string) string {
 	return temp
 }
 
+
 // replace env default setting
 func ReplaceStringDefaultENV(str string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(str, "$DefaultPassword", ReplaceDefaultENV("$DefaultPassword", "")), "$DefaultUserName", ReplaceDefaultENV("$DefaultUserName", ""))
